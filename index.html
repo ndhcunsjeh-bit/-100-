@@ -1,0 +1,797 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>是男人就下100层</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box;}
+  html,body{height:100%;overflow:hidden;touch-action:none;-webkit-user-select:none;user-select:none;
+    background:#000;display:flex;align-items:center;justify-content:center;
+    font-family:"Courier New","Microsoft YaHei",monospace;}
+  #wrap{position:relative;}
+  canvas{display:block;image-rendering:pixelated;image-rendering:crisp-edges;}
+  /* 像素风按钮：黑底白边、直角、悬停反色 */
+  #btn{position:absolute;left:50%;top:404px;transform:translate(-50%,-50%);
+    padding:14px 30px;font-family:"Courier New","Microsoft YaHei",monospace;
+    font-size:18px;font-weight:bold;letter-spacing:2px;
+    color:#fff;background:#000;border:3px solid #fff;
+    box-shadow:4px 4px 0 rgba(0,0,0,.6);
+    cursor:pointer;display:none;text-shadow:2px 2px 0 #000;}
+  #btn:hover{background:#fff;color:#000;text-shadow:none;}
+  #btn:active{transform:translate(-50%,-50%) translate(2px,2px);box-shadow:2px 2px 0 rgba(0,0,0,.6);}
+  /* 难度选择：三格并排，选中项反色 + 按难度着色 */
+  #diff{position:absolute;left:50%;top:322px;transform:translateX(-50%);
+    display:none;gap:8px;}
+  #diff .d{width:104px;height:46px;padding:0;
+    font-family:"Courier New","Microsoft YaHei",monospace;
+    font-size:16px;font-weight:bold;letter-spacing:1px;
+    color:#fff;background:#000;border:3px solid #fff;
+    box-shadow:3px 3px 0 rgba(0,0,0,.6);
+    cursor:pointer;text-shadow:1px 1px 0 #000;}
+  #diff .d:hover{background:#3A3A3A;}
+  #diff .d.on{background:#fff;color:#000;text-shadow:none;}
+  #diff .d.on[data-k="easy"]{color:#00A02A;}
+  #diff .d.on[data-k="hard"]{color:#B07A00;}
+  #diff .d.on[data-k="hell"]{color:#D01A1A;}
+  .pad{position:absolute;bottom:18px;width:62px;height:62px;
+    background:rgba(0,0,0,.45);border:3px solid #fff;color:#fff;
+    font-size:22px;line-height:56px;text-align:center;display:none;z-index:5;}
+  #padL{left:14px;} #padR{right:14px;}
+  @media (pointer:coarse){.pad{display:block;}}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="cv" width="420" height="640"></canvas>
+  <div id="diff">
+    <button class="d" id="d-easy" data-k="easy">简单</button>
+    <button class="d" id="d-hard" data-k="hard">困难</button>
+    <button class="d" id="d-hell" data-k="hell">地狱</button>
+  </div>
+  <button id="btn">开始游戏</button>
+  <div class="pad" id="padL">◀</div>
+  <div class="pad" id="padR">▶</div>
+</div>
+<script>
+"use strict";
+/* ============================================================
+   是男人就下100层 · 千禧年像素 Flash 风
+   全部图形用 Canvas 代码绘制，无外部素材
+   ============================================================ */
+const cv  = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+const btn = document.getElementById('btn');
+ctx.imageSmoothingEnabled = false;
+
+const W = 420, H = 640;
+const WALL_W = 14;                                       // 左右砖墙宽度
+const FIELD = { x:WALL_W, y:40, w:W-WALL_W*2, h:H-40 };  // 深渊内部
+const F_TOP = FIELD.y;                                   // 深渊顶部
+const CEIL = F_TOP + 22;                                 // 天花板挤压线（锯齿尖下方）
+const CEIL_GATE = CEIL + 34;                             // 这道线以上的板子一律不能站（会被抬到压扁）
+const G = 1800, MOVE = 290;          // 重力 / 水平移动速度（不随难度变化，操作手感统一）
+const PITCH  = 88;       // 每两层之间的垂直间隔（统一）
+const PLAT_W = 92;       // 所有平台 / 弹板 / 尖刺板的长度（统一）
+const PLAT_H = 18;       // 板厚
+
+/* 特殊平台参数 */
+const DEPTH_UNIT  = 102;   // 深度因子单位：d = 距出生板的距离 / DEPTH_UNIT（每层约 +0.86）
+const FLIP_TIME   = 0.42;  // 翻转铁板：从踩上到彻底翻过去所需时间（秒）
+const FLIP_DROP   = 0.55;  // 翻到 55% 时把人漏下去（撤掉支撑，且不可再站）
+const SPRING_LOCK = 0.22;  // 踩弹簧后的「竖直锁定」秒数：期间不接受左右输入，保证竖直起跳
+const BELT_SPEED  = 120;   // 传送带横向速度。必须 < MOVE/2，否则玩家逆着走不动 = 单程陷阱
+
+/* 难度表：只调「节奏 / 陷阱密度 / 伤害」三项，重力与移动速度恒定。
+   注意各类型概率之和必须 < 1（普通板吃剩下的部分）。 */
+const DIFF = {
+  easy: { name:'简单', riseBase:54, riseGain:1.45, riseMax:190,
+          spikeMul:0.55, flipMul:0.75, burn:7,  hitSpike:7,  hitTop:7,
+          color:'#00E03C', hint:'上升较慢 · 陷阱稀少 · 伤害较低' },
+  hard: { name:'困难', riseBase:68, riseGain:1.9,  riseMax:265,
+          spikeMul:1.0,  flipMul:1.0,  burn:11, hitSpike:12, hitTop:12,
+          color:'#FFC400', hint:'标准节奏 · 原汁原味' },
+  hell: { name:'地狱', riseBase:88, riseGain:2.5,  riseMax:345,
+          spikeMul:1.5,  flipMul:1.3,  burn:17, hitSpike:19, hitTop:19,
+          color:'#FF2A2A', hint:'高速上升 · 陷阱密集 · 伤害翻倍' }
+};
+const DIFF_ORDER = ['easy','hard','hell'];
+
+/* 调色板 */
+const C = {
+  bgTop:'#0000CD', bgBot:'#1E90FF',
+  brick:'#808080', brickHi:'#C0C0C0', brickLo:'#4A4A4A', line:'#000000',
+  plat:'#C0C0C0', platHi:'#FFFFFF', platLo:'#696969',
+  spike:'#F5F5F5', spikeBase:'#555555',
+  green:'#00FF00', magenta:'#FF00FF', yellow:'#FFFF00'
+};
+
+/* ===================== 音效 ===================== */
+let AC = null;
+function beep(freq, dur, type, vol){
+  try{
+    if(!AC) AC = new (window.AudioContext||window.webkitAudioContext)();
+    const o = AC.createOscillator(), g = AC.createGain();
+    o.type = type||'square'; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol||0.05, AC.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, AC.currentTime+dur);
+    o.connect(g); g.connect(AC.destination);
+    o.start(); o.stop(AC.currentTime+dur);
+  }catch(e){}
+}
+
+/* ===================== 底纹贴图（斑驳大理石/水波） ===================== */
+const texNoise = (function(){
+  const c = document.createElement('canvas'); c.width = c.height = 72;
+  const x = c.getContext('2d');
+  x.strokeStyle = 'rgba(0,0,0,.16)'; x.lineWidth = 2;
+  for(let i=-72;i<144;i+=12){
+    x.beginPath(); x.moveTo(i,0); x.lineTo(i+72,72); x.stroke();
+  }
+  let seed = 7717;
+  const R = ()=> (seed = (seed*1103515245+12345) & 0x7fffffff)/0x7fffffff;
+  for(let i=0;i<220;i++){
+    x.fillStyle = R() > .5 ? 'rgba(0,0,0,.20)' : 'rgba(255,255,255,.10)';
+    const s = R() > .8 ? 3 : 2;
+    x.fillRect((R()*72)|0, (R()*72)|0, s, s);
+  }
+  return ctx.createPattern(c,'repeat');
+})();
+
+/* ===================== 小工具 ===================== */
+const rnd = (a,b)=> a + Math.random()*(b-a);
+// 像素描边矩形：填充 + 1px 黑描边
+function px(x,y,w,h,fill,stroke){
+  x = Math.round(x); y = Math.round(y); w = Math.round(w); h = Math.round(h);
+  if(w<=0||h<=0) return;
+  ctx.fillStyle = fill || '#fff'; ctx.fillRect(x,y,w,h);
+  if(stroke !== false){
+    ctx.strokeStyle = stroke || C.line; ctx.lineWidth = 1;
+    ctx.strokeRect(x+0.5, y+0.5, w-1, h-1);
+  }
+}
+function pxText(txt,x,y,size,color,align){
+  ctx.save();
+  ctx.font = 'bold ' + size + 'px "Courier New","Microsoft YaHei",monospace';
+  ctx.textAlign = align || 'left';
+  ctx.fillStyle = color; ctx.fillText(txt,x,y);
+  ctx.restore();
+}
+
+/* ===================== 状态 ===================== */
+let player, plats, camY, wallScroll, floor, hp, state, shake, genY, nextId, particles,
+    flashT, overReason, best, startDepth, bannerT, passed100,
+    bannerTitle, bannerSub, bannerColor, diffKey, D;
+/* 难度：读回上次的选择（默认困难）；纪录按难度分别保存，互不污染 */
+diffKey = DIFF[localStorage.getItem('down100_diff')] ? localStorage.getItem('down100_diff') : 'hard';
+D = DIFF[diffKey];
+best = +(localStorage.getItem('down100_best_' + diffKey) || 0);
+function saveBest(){ localStorage.setItem('down100_best_' + diffKey, best); }
+
+function reset(){
+  player = { x:FIELD.x+70, y:F_TOP+140, w:20, h:30, vx:0, vy:0, on:null, face:1, inv:0, anim:0, drain:0, burn:0, lock:0 };
+  plats = []; particles = [];
+  camY = player.y - 300; wallScroll = 0;
+  floor = 0; hp = 100; shake = 0; flashT = 0; nextId = 1; overReason = '';
+  bannerT = 0; passed100 = false;
+  const startY = player.y + 64;                      // 出生板在脚下（防开局自由落体）
+  startDepth = startY;
+  plats.push(mkPlat((FIELD.x + FIELD.w/2 - PLAT_W/2)|0, startY, PLAT_W, 'normal'));
+  lastX = (FIELD.x + FIELD.w/2 - PLAT_W/2);          // 出生板在中间，之后全宽随机
+  genY = startY;
+  while(deepestY() < camY + FIELD.y + FIELD.h + 420) spawnPlat();
+}
+function mkPlat(x,y,w,type){
+  return { id:nextId++, x, y, w, h:PLAT_H, type, st:0, t:0, vy:0,
+           dir: type==='belt' ? (Math.random() < 0.5 ? -1 : 1) : 0,   // 传送带方向
+           anim:Math.random()*6.28 };
+}
+// 当前最深的平台。所有平台类型都钉在生成网格上（翻转铁板只换面、不移动），
+// 所以一律参与计算——否则生成基准会跳回上一块，把层间距打乱。
+function deepestY(){
+  let m = -Infinity;
+  for(const pl of plats) if(pl.y > m) m = pl.y;
+  return m;
+}
+// 横向位置：全宽随机落点；只要求与上一块错开半个板宽，避免两块叠在同一处
+let lastX = null;
+function nextPlatX(){
+  const minX = FIELD.x + 4, maxX = FIELD.x + FIELD.w - 4 - PLAT_W;
+  let x = rnd(minX, maxX);
+  for(let t = 0; t < 12 && lastX !== null && Math.abs(x - lastX) < PLAT_W * 0.5; t++){
+    x = rnd(minX, maxX);
+  }
+  lastX = x;
+  return x;
+}
+// 按深度 d 与当前难度决定这块板子的类型（各类型独立概率，普通板吃剩余部分）
+// 0.75 = 早期版本「尖刺减少 1/4」的遗留系数；D.spikeMul / D.flipMul 为难度倍率
+function pickType(d){
+  const pSpike  = (0.15 + Math.min(0.13, d*0.004)) * 0.75 * D.spikeMul;
+  const pSpring = 0.17;
+  const pFlip   = (0.12 + Math.min(0.14, d*0.005)) * D.flipMul;   // 翻转铁板（沿用原易碎板的位置与密度）
+  const pBelt   = 0.10;                                            // 传送带（不随难度变）
+  if(d <= 3) return 'normal';                        // 浅层不出陷阱
+  const r = Math.random();
+  if(r < pSpike) return 'spike';
+  if(r < pSpike + pSpring) return 'spring';
+  if(r < pSpike + pSpring + pFlip) return 'flip';
+  if(r < pSpike + pSpring + pFlip + pBelt) return 'belt';
+  return 'normal';
+}
+// 相对最深平台生成：保证任意两层之间的垂直间隔恒为 PITCH
+function spawnPlat(){
+  const base = deepestY();
+  const y = isFinite(base) ? base + PITCH : genY;
+  genY = y;
+  const d = Math.max(0, (y - startDepth)/DEPTH_UNIT);  // 深度因子（只影响陷阱类型与上升速度）
+  const x = nextPlatX();
+  plats.push(mkPlat(x, y, PLAT_W, pickType(d)));
+}
+
+/* ===================== 粒子 ===================== */
+function puff(x,y,color,n){
+  for(let i=0;i<(n||8);i++)
+    particles.push({x,y,vx:rnd(-95,95),vy:rnd(-150,-30),life:rnd(.28,.58),t:0,color});
+}
+
+/* ===================== 伤害 ===================== */
+function hurt(amount, reason){
+  if(player.inv > 0) return;
+  hp -= amount; player.inv = 1.1; flashT = .28; shake = 9;
+  beep(170,.18,'square',.07);
+  puff(player.x+player.w/2, player.y+player.h, C.platHi, 12);
+  if(hp <= 0){ hp = 0; gameOver(reason); }
+}
+// 站在尖刺上：持续掉血（不吃无敌帧，不躲开就一直掉）。每秒伤害见 DIFF[k].burn
+function spikeBurn(dt){
+  const p = player;
+  p.burn += dt;
+  hp -= D.burn*dt;
+  if(shake < 3) shake = 3;
+  if(flashT < 0.10) flashT = 0.10;
+  puff(p.x+rnd(0,p.w), p.y+p.h-4, '#FF6B7A', 1);
+  if((p.burn % 0.5) < dt) beep(240,.06,'square',.03);
+  if(hp <= 0){ hp = 0; gameOver('spike'); }
+}
+function gameOver(reason){
+  state = 'over'; overReason = reason;
+  if(floor > best){ best = floor; saveBest(); }
+  beep(130,.5,'square',.09);
+  syncUI();
+}
+
+/* ===================== 输入 ===================== */
+const keys = {};
+addEventListener('keydown', e=>{
+  keys[e.code] = true;
+  // 开始 / 结束界面都能选难度（与难度按钮的可见状态保持一致），游戏中不可切
+  if(state !== 'play'){
+    const i = DIFF_ORDER.indexOf(diffKey);
+    if(e.code==='Digit1') selectDiff('easy');
+    else if(e.code==='Digit2') selectDiff('hard');
+    else if(e.code==='Digit3') selectDiff('hell');
+    else if(e.code==='ArrowLeft')  selectDiff(DIFF_ORDER[Math.max(0, i-1)]);
+    else if(e.code==='ArrowRight') selectDiff(DIFF_ORDER[Math.min(DIFF_ORDER.length-1, i+1)]);
+  }
+  if(e.code==='Space'||e.code==='Enter'||e.code==='ArrowUp'){
+    e.preventDefault();
+    if(state!=='play') startGame();
+  }
+});
+addEventListener('keyup', e=> keys[e.code] = false);
+function bindHold(id, code){
+  const el = document.getElementById(id);
+  const on = e=>{ e.preventDefault(); keys[code]=true; };
+  const off= e=>{ e.preventDefault(); keys[code]=false; };
+  el.addEventListener('touchstart',on); el.addEventListener('touchend',off);
+  el.addEventListener('touchcancel',off);
+  el.addEventListener('mousedown',on); el.addEventListener('mouseup',off);
+  el.addEventListener('mouseleave',off);
+}
+bindHold('padL','ArrowLeft'); bindHold('padR','ArrowRight');
+
+/* 难度按钮：DOM 里三格固定，这里只做绑定与高亮 */
+const diffBox  = document.getElementById('diff');
+const diffBtns = {};
+DIFF_ORDER.forEach(k=>{
+  const b = document.getElementById('d-' + k);
+  b.addEventListener('click', e=>{ e.preventDefault(); selectDiff(k); });
+  diffBtns[k] = b;
+});
+function selectDiff(k){
+  if(state === 'play') return;                  // 游戏中不允许换难度
+  diffKey = k; D = DIFF[k];
+  localStorage.setItem('down100_diff', k);
+  best = +(localStorage.getItem('down100_best_' + k) || 0);   // 纪录按难度独立
+  syncUI();
+}
+function startGame(){
+  const fromReady = (state === 'ready');
+  reset(); state = 'play'; syncUI();
+  if(fromReady) showBanner(D.name + ' 模式', D.hint, D.color, 2.4);
+}
+btn.addEventListener('click', e=>{ e.preventDefault(); startGame(); });
+// 只有结束界面允许点画布重开：开始界面点画布会误触、跳过难度选择
+cv.addEventListener('pointerdown', ()=>{ if(state === 'over') startGame(); });
+
+function syncUI(){
+  if(state==='ready'){ btn.style.display='block'; btn.textContent='开始游戏'; }
+  else if(state==='over'){ btn.style.display='block'; btn.textContent='再来一次'; }
+  else btn.style.display='none';
+  // 难度选择在「开始 / 结束」两屏都可见，方便死后换个难度再来
+  diffBox.style.display = (state==='play') ? 'none' : 'flex';
+  for(const k of DIFF_ORDER) diffBtns[k].className = (k===diffKey) ? 'd on' : 'd';
+}
+
+/* ===================== 逻辑 ===================== */
+function update(dt){
+  const p = player;
+  const rise = Math.min(D.riseMax, D.riseBase + floor*D.riseGain);
+  wallScroll += rise*dt;
+
+  for(const pl of plats){
+    pl.y -= rise*dt;
+    pl.anim += dt*6;
+    // 翻转铁板：踩上后绕水平轴翻转，翻到一半撤掉支撑（人漏下去），翻完变成不能站的背面
+    if(pl.type==='flip' && pl.st===1){
+      pl.t += dt;
+      if(!pl.droped && pl.t >= FLIP_TIME*FLIP_DROP){
+        pl.droped = true;
+        if(player.on === pl){ player.on = null; player.vy = Math.max(player.vy, 160); }
+      }
+      if(pl.t >= FLIP_TIME) pl.st = 2;
+    }
+  }
+  // 回收视野上方的板。所有平台类型都钉在生成网格上，不会向下坠落
+  plats = plats.filter(pl => pl.y > camY - 90);
+  while(deepestY() < camY + FIELD.y + FIELD.h + 420) spawnPlat();
+
+  // 水平移动
+  let dir = 0;
+  if(keys.ArrowLeft||keys.KeyA) dir -= 1;
+  if(keys.ArrowRight||keys.KeyD) dir += 1;
+  if(p.lock > 0){ p.lock -= dt; dir = 0; }   // 刚被弹起：锁掉左右输入，保证是竖直起跳
+  p.vx = dir*MOVE;
+  p.x += p.vx*dt;
+  p.x = Math.max(FIELD.x+2, Math.min(FIELD.x+FIELD.w-2-p.w, p.x));
+  if(dir) p.face = dir;
+  p.anim += Math.abs(p.vx)*dt*0.06;
+  if(p.inv>0) p.inv -= dt;
+
+  // 站在板上：必须仍在板子上方、板子没翻、没被抬到天花板附近；否则立刻失去支撑受重力下落
+  if(p.on){
+    const pl = p.on;
+    if(pl.st===2 || plats.indexOf(pl)<0 || pl.y - camY < CEIL_GATE ||
+       p.x + p.w <= pl.x + 2 || p.x >= pl.x + pl.w - 2){
+      p.on = null;
+    } else {
+      p.y = pl.y - p.h; p.vy = 0;
+      if(pl.type==='belt'){                       // 传送带：持续横向推动（可对抗，见常量注释）
+        p.x += pl.dir * BELT_SPEED * dt;
+        p.x = Math.max(FIELD.x+2, Math.min(FIELD.x+FIELD.w-2-p.w, p.x));
+        p.anim += Math.abs(BELT_SPEED)*dt*0.06;   // 被传送时也走腿
+        pl.t += dt;
+        if(pl.t >= 0.36){ pl.t = 0; beep(200,.03,'square',.02); }
+      }
+      if(pl.id > floor) floor = pl.id;
+      if(pl.type==='spike') spikeBurn(dt);      // 尖刺是实体：站着不躲就一直掉血
+      else p.burn = 0;
+    }
+  }
+
+  // 下落 & 扫掠碰撞（取本帧穿越的最高一块）
+  const prevFeet = p.y + p.h;
+  if(!p.on){
+    p.vy = Math.min(p.vy + G*dt, 760);
+    p.y += p.vy*dt;
+    const feet = p.y + p.h;
+    if(p.vy > 0){
+      let hit = null;
+      for(const pl of plats){
+        if(pl.st===2) continue;
+        if(pl.y - camY < CEIL_GATE) continue;
+        if(feet >= pl.y && prevFeet <= pl.y + 12 &&
+           p.x + p.w > pl.x + 3 && p.x < pl.x + pl.w - 3){
+          if(!hit || pl.y < hit.y) hit = pl;
+        }
+      }
+      if(hit){
+        const pl = hit;
+        if(pl.type==='spike'){
+          p.y = pl.y - p.h; p.vy = 0; p.on = pl;    // 实体：踩上去站住
+          p.burn = 0;
+          hurt(D.hitSpike,'spike');                  // 落地那一下的伤害（随难度）
+          if(pl.id > floor) floor = pl.id;
+        } else if(pl.type==='spring'){
+          p.y = pl.y - p.h; p.vy = -620; p.on = null;
+          p.vx = 0; p.lock = SPRING_LOCK;             // 竖直起跳：锁掉横移，不带斜向漂移
+          beep(660,.10,'square',.06); setTimeout(()=>beep(920,.09,'square',.05),70);
+          puff(p.x+p.w/2, pl.y, C.yellow, 10);
+          if(pl.id > floor) floor = pl.id;
+        } else {
+          p.y = pl.y - p.h; p.vy = 0; p.on = pl;
+          if(pl.type==='flip' && pl.st===0){ pl.st = 1; pl.t = 0; }   // 踩上即开始翻转
+          beep(300,.045,'square',.035);
+          puff(p.x+p.w/2, pl.y, C.platHi, 5);
+          if(pl.id > floor) floor = pl.id;
+        }
+      }
+    }
+  }
+
+  // 天花板硬约束
+  if(p.y - camY < CEIL){
+    p.y = camY + CEIL;
+    if(p.on) p.on = null;
+    if(p.vy < 0) p.vy = 0;
+    p.vy = Math.max(p.vy, 140);
+    p.drain += dt;
+    if(p.drain > 0.3){ p.drain = 0; hurt(D.hitTop,'top'); p.vy = 140; }
+  } else if(p.drain > 0){
+    p.drain = Math.max(0, p.drain - dt*0.8);
+  }
+
+  // 摄像机
+  const target = p.y - (F_TOP + FIELD.h*0.42);
+  if(target > camY) camY = target;
+
+  // 100 层里程碑：不结束，提示后继续下潜
+  if(floor >= 100 && !passed100){
+    passed100 = true;
+    showBanner('100 层达成！', '继续下潜，冲击更高纪录', C.magenta, 3.2);
+    beep(523,.14,'square',.07); setTimeout(()=>beep(659,.14,'square',.07),140);
+    setTimeout(()=>beep(784,.14,'square',.07),280); setTimeout(()=>beep(1046,.3,'square',.07),420);
+  }
+  // 纪录实时刷新
+  if(floor > best){ best = floor; saveBest(); }
+
+  for(const pt of particles){ pt.t+=dt; pt.x+=pt.vx*dt; pt.y+=pt.vy*dt; pt.vy+=620*dt; }
+  particles = particles.filter(pt=>pt.t<pt.life);
+}
+
+// 横幅提示（开局难度 / 100 层达成共用同一条通道）
+function showBanner(title, sub, color, secs){
+  bannerTitle = title; bannerSub = sub; bannerColor = color || C.magenta; bannerT = secs;
+}
+
+// 受击抖动 / 闪红：任何状态下都要衰减，否则结束界面会一直抖、一直闪红
+function decayFx(dt){
+  if(shake > 0)  shake  = Math.max(0, shake  - dt*36);
+  if(flashT > 0) flashT = Math.max(0, flashT - dt);
+  if(bannerT > 0) bannerT = Math.max(0, bannerT - dt);
+}
+
+/* ===================== 绘制：深渊背景 ===================== */
+function drawBackground(){
+  const g = ctx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0, C.bgTop); g.addColorStop(1, C.bgBot);
+  ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+  ctx.save();
+  ctx.beginPath(); ctx.rect(0,0,W,H); ctx.clip();
+  ctx.translate(0, -((camY*0.35) % 72));
+  ctx.fillStyle = texNoise;
+  ctx.fillRect(0, -72, W, H+144);
+  ctx.restore();
+}
+
+/* ===================== 绘制：两侧砖墙 ===================== */
+function drawWalls(){
+  const bh = 14;
+  const off = wallScroll % (bh*2);
+  for(let side=0; side<2; side++){
+    const wx = side===0 ? 0 : W-WALL_W;
+    for(let r=-2; r<Math.ceil(H/bh)+2; r++){
+      const y = r*bh - off;
+      px(wx, y, WALL_W, bh, C.brick);
+      ctx.fillStyle = C.brickHi; ctx.fillRect(wx+1, y+1, WALL_W-2, 2);
+      ctx.fillStyle = C.brickLo; ctx.fillRect(wx+1, y+bh-3, WALL_W-2, 2);
+      // 砖缝（隔行错位）
+      ctx.fillStyle = 'rgba(0,0,0,.55)';
+      const seam = side===0 ? wx+WALL_W-6 : wx+4;
+      if(r % 2 === 0) ctx.fillRect(seam, y+3, 2, bh-6);
+      else            ctx.fillRect(seam, y+bh-5, 2, 5);
+    }
+    // 内侧黑色描边
+    ctx.fillStyle = '#000';
+    ctx.fillRect(side===0 ? WALL_W-2 : W-WALL_W, 0, 2, H);
+  }
+}
+
+/* ===================== 绘制：天花板锯齿 ===================== */
+function drawCeiling(){
+  const y = F_TOP;
+  px(0, y, W, 9, C.spikeBase, '#000');                    // 深灰底座
+  ctx.fillStyle = '#7A7A7A'; ctx.fillRect(1, y+2, W-2, 2);
+  const step = 14;
+  for(let x=0; x<W; x+=step){
+    ctx.beginPath();
+    ctx.moveTo(x+1, y+8);
+    ctx.lineTo(x+step/2, y+21);
+    ctx.lineTo(x+step-1, y+8);
+    ctx.closePath();
+    ctx.fillStyle = C.spike; ctx.fill();
+    ctx.strokeStyle = '#000'; ctx.lineWidth = 1.4; ctx.stroke();
+  }
+}
+
+/* ===================== 绘制：平台 ===================== */
+function drawPlat(pl){
+  const y = pl.y - camY;
+  if(y < F_TOP-40 || y > H+40) return;
+  const x = Math.round(pl.x), w = Math.round(pl.w), h = pl.h || PLAT_H;
+
+  if(pl.type==='spike'){
+    // 深灰底座
+    px(x, y+8, w, h-8, C.spikeBase, '#000');
+    ctx.fillStyle = '#7a7a7a'; ctx.fillRect(x+2, y+10, w-4, 2);
+    // 银白等腰三角锯齿
+    const n = Math.max(3, Math.round(w/12)), sw = w/n;
+    for(let i=0;i<n;i++){
+      const bx = x + i*sw;
+      ctx.beginPath();
+      ctx.moveTo(bx, y+10);
+      ctx.lineTo(bx+sw/2, y-8);
+      ctx.lineTo(bx+sw, y+10);
+      ctx.closePath();
+      ctx.fillStyle = C.spike; ctx.fill();
+      ctx.strokeStyle = '#000'; ctx.lineWidth = 1.6; ctx.stroke();
+    }
+  } else if(pl.type==='spring'){
+    // 银灰板 + 铺满整板的绿白斜纹弹簧（参考经典画面）
+    px(x, y, w, h, C.plat, '#000');
+    ctx.fillStyle = C.platHi; ctx.fillRect(x+1, y+1, w-2, 3);
+    ctx.fillStyle = C.platLo; ctx.fillRect(x+1, y+h-4, w-2, 4);
+    const bx = x+2, by = y+4, bw = w-4, bh = h-8;
+    ctx.save();
+    ctx.beginPath(); ctx.rect(bx, by, bw, bh); ctx.clip();
+    ctx.fillStyle = '#FFFFFF'; ctx.fillRect(bx, by, bw, bh);
+    ctx.fillStyle = '#00C400';
+    for(let i = -bh; i < bw + bh; i += 9){
+      ctx.beginPath();
+      ctx.moveTo(bx+i, by+bh);
+      ctx.lineTo(bx+i+bh, by);
+      ctx.lineTo(bx+i+bh+4, by);
+      ctx.lineTo(bx+i+4, by+bh);
+      ctx.closePath(); ctx.fill();
+    }
+    ctx.restore();
+    ctx.strokeStyle = '#000'; ctx.lineWidth = 1;
+    ctx.strokeRect(bx+0.5, by+0.5, bw-1, bh-1);
+  } else if(pl.type==='flip'){
+    // 翻转铁板：绕水平中轴翻转 —— 板厚按 |cos| 投影（1→0→1），翻过去后是深色背面且不能站
+    const k  = pl.st === 0 ? 0 : Math.min(1, pl.t / FLIP_TIME);
+    const h2 = Math.max(2, Math.round(h * Math.abs(Math.cos(k * Math.PI))));
+    const yy = Math.round(y + (h - h2) / 2);
+    const face = pl.st === 2 ? '#6A6A6A' : (k > 0.5 ? '#9A9A9A' : C.plat);
+    px(x, yy, w, h2, face, '#000');
+    if(pl.st === 2){
+      ctx.fillStyle = '#4A4A4A'; ctx.fillRect(x+1, yy+1, w-2, 2);          // 背面高光偏暗
+      ctx.fillStyle = '#565656'; ctx.fillRect(x+3, yy+4, w-6, 1);          // 加强筋
+      ctx.fillStyle = '#565656'; ctx.fillRect(x+3, yy+h2-5, w-6, 1);
+    } else if(h2 >= 6){
+      ctx.fillStyle = C.platHi; ctx.fillRect(x+1, yy+1, w-2, 2);
+      ctx.fillStyle = C.platLo; ctx.fillRect(x+1, yy+h2-3, w-2, 2);
+      ctx.fillStyle = '#4A4A4A';                                           // 两端铰链
+      ctx.fillRect(x+4, yy + (h2>>1) - 1, 3, 3);
+      ctx.fillRect(x+w-7, yy + (h2>>1) - 1, 3, 3);
+    }
+  } else if(pl.type==='belt'){
+    // 传送带：两端金属滚轮 + 中间滚动履带（参考经典 Flash 传送带造型）
+    const r  = h/2;                       // 滚轮半径 = 板厚一半（滚轮上下微微鼓出带面）
+    const cy = y + r;                     // 水平中轴
+    const bw = w - 2*r;                   // 带面长度
+    const bh = Math.max(6, h-10);         // 带面厚度（比滚轮细）
+    const by = cy - bh/2;
+
+    // ① 履带底座（深色缝隙），胶囊形轮廓
+    ctx.beginPath();
+    ctx.moveTo(x+r, y);
+    ctx.lineTo(x+w-r, y);
+    ctx.arc(x+w-r, cy, r, -Math.PI/2, Math.PI/2);
+    ctx.lineTo(x+r, y+h);
+    ctx.arc(x+r, cy, r, Math.PI/2, Math.PI*1.5);
+    ctx.closePath();
+    ctx.fillStyle = '#8E8E8E'; ctx.fill();
+    ctx.strokeStyle = '#000'; ctx.lineWidth = 1; ctx.stroke();
+
+    // ② 上下边缘的分段履带齿，沿方向滚动（线速度 = BELT_SPEED = anim×20）
+    const spacing = 10, shift = ((pl.anim*20) % spacing) * (pl.dir > 0 ? 1 : -1);
+    ctx.save();
+    ctx.beginPath(); ctx.rect(x+r-1, y+1, bw+2, h-2); ctx.clip();
+    for(let i = -1; i <= Math.ceil((bw+2)/spacing); i++){
+      const ax = Math.round(x+r-1 + shift + i*spacing);
+      ctx.fillStyle = '#E4E4E4'; ctx.fillRect(ax, y+1, spacing-3, 4);      // 上齿
+      ctx.fillStyle = '#D2D2D2'; ctx.fillRect(ax, y+h-5, spacing-3, 4);    // 下齿
+    }
+    ctx.restore();
+
+    // ③ 中间带面（浅银灰）
+    px(x+r, by, bw, bh, '#EDEDED', '#000');
+    ctx.fillStyle = '#FFFFFF'; ctx.fillRect(Math.round(x+r)+1, Math.round(by)+1, bw-2, 2);
+    ctx.fillStyle = '#B4B4B4'; ctx.fillRect(Math.round(x+r)+1, Math.round(by)+bh-3, bw-2, 2);
+
+    // ④ 两端滚轮（金属轮：外圈 + 内盘 + 左上高光 + 轴心）
+    for(const cx of [x+r, x+w-r]){
+      ctx.beginPath(); ctx.arc(cx, cy, r-0.5, 0, Math.PI*2);
+      ctx.fillStyle = '#D8D8D8'; ctx.fill();
+      ctx.strokeStyle = '#000'; ctx.lineWidth = 1; ctx.stroke();
+      ctx.beginPath(); ctx.arc(cx, cy, r-2.5, 0, Math.PI*2);
+      ctx.fillStyle = '#EFEFEF'; ctx.fill();
+      ctx.beginPath(); ctx.arc(cx-1.5, cy-1.5, Math.max(1, r-5), 0, Math.PI*2);
+      ctx.fillStyle = '#FFFFFF'; ctx.fill();
+      ctx.beginPath(); ctx.arc(cx, cy, 1.5, 0, Math.PI*2);
+      ctx.fillStyle = '#666666'; ctx.fill();
+    }
+  } else {
+    const base = C.plat;
+    px(x, y, w, h, base, '#000');
+    ctx.fillStyle = C.platHi; ctx.fillRect(x+1, y+1, w-2, 3);
+    ctx.fillStyle = C.platLo; ctx.fillRect(x+1, y+h-4, w-2, 4);
+    ctx.fillStyle = '#8D8D8D';
+    ctx.fillRect(x+5, y+7, 3, 3); ctx.fillRect(x+w-8, y+7, 3, 3);
+  }
+  if(pl.id === 100) pxText('★100层', x+w/2, y-14, 13, C.yellow, 'center');
+}
+
+/* ===================== 绘制：玩家（像素小人，20x30） ===================== */
+function drawMan(p){
+  const px0 = Math.round(p.x), py0 = Math.round(p.y - camY);
+  const walking = p.on && (p.vx !== 0 || p.on.type === 'belt');   // 被传送带推着走时也要迈腿
+  const sw = walking ? Math.round(Math.sin(p.anim)*3) : 0;
+  const airborne = !p.on;
+  const SKIN='#FFD8A8', HAT='#E53935', SHIRT='#FFD400', PANTS='#1E5FE0', SHOE='#3A2A18';
+
+  ctx.save();
+  if(p.inv>0 && Math.floor(p.inv*14)%2===0) ctx.globalAlpha = .4;
+  // 左右翻转：Scale X -1
+  ctx.translate(px0 + (p.face<0 ? p.w : 0), py0);
+  ctx.scale(p.face, 1);
+
+  const outline = (x,y,w,h)=>{ ctx.fillStyle='#000'; ctx.fillRect(x-1,y-1,w+2,h+2); };
+  const part = (x,y,w,h,color)=>{ outline(x,y,w,h); ctx.fillStyle=color; ctx.fillRect(x,y,w,h); };
+
+  part(4, 0, 12, 6, HAT);                     // 红帽
+  part(2, 5, 16, 3, HAT);                     // 帽檐
+  part(4, 8, 12, 8, SKIN);                    // 脸
+  ctx.fillStyle = '#000';
+  ctx.fillRect(7, 10, 2, 3); ctx.fillRect(12, 10, 2, 3);   // 眼
+  ctx.fillRect(8, 14, 5, 1);                                // 嘴
+  part(4, 16, 12, 8, SHIRT);                  // 黄衣
+  part(1, 17, 3, 6, SHIRT);                   // 手臂
+  part(16, 17, 3, 6, SHIRT);
+  part(5, 23, 10, 3, PANTS);                  // 背带裤
+  part(5, 26 + Math.max(0,sw), 4, 3, PANTS);  // 腿
+  part(11, 26 + Math.max(0,-sw), 4, 3, PANTS);
+  part(4, 28 + Math.max(0,sw), 6, 2, SHOE);   // 鞋
+  part(10, 28 + Math.max(0,-sw), 6, 2, SHOE);
+  if(airborne){ ctx.fillStyle='#000'; ctx.fillRect(0,15,1,8); ctx.fillRect(19,15,1,8); }
+  ctx.restore();
+}
+
+/* ===================== 绘制：HUD 状态栏 ===================== */
+function drawHUD(){
+  ctx.fillStyle = 'rgba(0,0,0,.62)'; ctx.fillRect(0,0,W,40);
+  ctx.strokeStyle = '#000'; ctx.lineWidth = 2; ctx.strokeRect(1,1,W-2,38);
+  ctx.fillStyle = 'rgba(255,255,255,.22)'; ctx.fillRect(0,38,W,1);
+
+  // 左：生命值 + 绿-黄-红三段进度条
+  pxText('生命值', 12, 26, 13, '#FFFFFF');
+  const bx = 74, by = 12, bw = 150, bh = 15;
+  px(bx, by, bw, bh, '#101010', '#000');
+  const pct = Math.max(0, Math.min(1, hp/100));
+  if(pct > 0){
+    const g = ctx.createLinearGradient(bx,0,bx+bw,0);
+    g.addColorStop(0, '#00E03C'); g.addColorStop(.5, '#FFE000'); g.addColorStop(1, '#FF2A2A');
+    ctx.save();
+    ctx.beginPath(); ctx.rect(bx+2, by+2, (bw-4)*pct, bh-4); ctx.clip();
+    ctx.fillStyle = g; ctx.fillRect(bx, by, bw, bh);
+    ctx.strokeStyle = 'rgba(0,0,0,.5)'; ctx.lineWidth = 1;
+    for(let i=1;i<5;i++){
+      const sx = bx + (bw/5)*i + .5;
+      ctx.beginPath(); ctx.moveTo(sx, by+2); ctx.lineTo(sx, by+bh-2); ctx.stroke();
+    }
+    ctx.restore();
+  }
+  ctx.strokeStyle = '#000'; ctx.lineWidth = 2; ctx.strokeRect(bx+1, by+1, bw-2, bh-2);
+  pxText(String(Math.max(0, Math.ceil(hp))).padStart(3,'0'), bx+bw+10, 26, 14, pct>.3 ? '#FFFFFF' : '#FF5555');
+
+  // 右：地下 00050 层（等宽像素字体 + 亮绿）
+  pxText('地下 ' + String(floor).padStart(5,'0') + ' 层', W-12, 27, 15, C.green, 'right');
+}
+
+/* 霓虹字：紫粉发光 + 黄色细描边 */
+function neon(txt, x, y, size, color){
+  ctx.save();
+  ctx.font = 'bold ' + size + 'px "Courier New","Microsoft YaHei",monospace';
+  ctx.textAlign = 'center';
+  ctx.lineJoin = 'round';
+  ctx.shadowColor = color; ctx.shadowBlur = 22;
+  ctx.fillStyle = color; ctx.fillText(txt,x,y); ctx.fillText(txt,x,y);
+  ctx.shadowBlur = 0;
+  ctx.strokeStyle = C.yellow; ctx.lineWidth = 2; ctx.strokeText(txt,x,y);
+  ctx.fillStyle = color; ctx.fillText(txt,x,y);
+  ctx.restore();
+}
+
+/* ===================== 主循环 ===================== */
+let last = performance.now();
+function loop(now){
+  const dt = Math.max(0, Math.min(0.033, (now-last)/1000));
+  last = now;
+  if(state==='play') update(dt);
+  decayFx(dt);
+  render();
+  requestAnimationFrame(loop);
+}
+
+function render(){
+  ctx.setTransform(1,0,0,1,0,0);
+  ctx.imageSmoothingEnabled = false;
+
+  drawBackground();
+
+  ctx.save();
+  if(shake>0) ctx.translate((rnd(-shake,shake)*.5)|0, (rnd(-shake,shake)*.5)|0);
+
+  ctx.save();
+  ctx.beginPath(); ctx.rect(FIELD.x, F_TOP, FIELD.w, FIELD.h); ctx.clip();
+  plats.forEach(drawPlat);
+  for(const pt of particles){
+    ctx.globalAlpha = 1 - pt.t/pt.life;
+    px(pt.x-2, pt.y-camY-2, 4, 4, pt.color, '#000');
+  }
+  ctx.globalAlpha = 1;
+  if(state!=='ready') drawMan(player);
+  if(bannerT > 0 && state==='play'){
+    ctx.globalAlpha = Math.min(1, bannerT/0.8);
+    ctx.fillStyle = 'rgba(0,0,0,.45)';
+    ctx.fillRect(FIELD.x, 150, FIELD.w, 92);
+    neon(bannerTitle, W/2, 196, 30, bannerColor);
+    pxText(bannerSub, W/2, 228, 15, C.green, 'center');
+    ctx.globalAlpha = 1;
+  }
+  ctx.restore();
+
+  drawWalls();
+  drawCeiling();
+  drawHUD();
+
+  if(flashT>0){
+    ctx.fillStyle = 'rgba(255,0,0,' + (flashT*0.6) + ')';
+    ctx.fillRect(FIELD.x, F_TOP, FIELD.w, FIELD.h);
+  }
+
+  if(state!=='play'){
+    ctx.fillStyle = 'rgba(0,0,0,.55)';
+    ctx.fillRect(FIELD.x, F_TOP, FIELD.w, FIELD.h);
+    ctx.save();
+    ctx.beginPath(); ctx.rect(FIELD.x, F_TOP, FIELD.w, FIELD.h); ctx.clip();
+
+    if(state==='ready'){
+      neon('是男人就下', W/2, 178, 40, C.magenta);
+      neon('100 层',    W/2, 240, 46, C.magenta);
+      pxText(D.name + ' · 最佳 ' + String(best).padStart(5,'0') + ' 层',
+             W/2, 278, 14, C.yellow, 'center');
+      pxText('← → 移动　躲尖刺　踩弹簧　别被顶到天花板', W/2, 306, 13, '#C0C0C0', 'center');
+    } else {
+      neon('游戏结束', W/2, 178, 36, '#FF4040');
+      pxText('地下 ' + String(floor).padStart(5,'0') + ' 层', W/2, 228, 20, C.green, 'center');
+      const rs = { spike:'被尖刺扎死了', top:'被挤到天花板压扁了' };
+      pxText(rs[overReason]||'', W/2, 260, 14, '#C0C0C0', 'center');
+      pxText(D.name + ' · ' + (floor >= 100 ? '已突破 100 层'
+             : '最高纪录 ' + String(best).padStart(5,'0') + ' 层'),
+             W/2, 292, 15, C.yellow, 'center');
+    }
+    ctx.restore();
+  }
+  ctx.restore();
+}
+
+reset();
+state = 'ready';
+syncUI();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
